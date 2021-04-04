@@ -1,0 +1,238 @@
+import pandas as pd
+import tensorflow as tf
+
+
+print(tf.__version__)
+
+data_train = pd.read_csv(
+  filepath_or_buffer='https://storage.googleapis.com/spls/gsp418/housing_train.csv',
+  names=["CRIM","ZN","INDUS","CHAS","NOX","RM","AGE","DIS","RAD","TAX","PTRATIO","MEDV"])
+
+data_test = pd.read_csv(
+  filepath_or_buffer='https://storage.googleapis.com/spls/gsp418/housing_test.csv',
+  names=["CRIM","ZN","INDUS","CHAS","NOX","RM","AGE","DIS","RAD","TAX","PTRATIO","MEDV"])
+
+data_train.head()
+
+FEATURES = ["CRIM", "ZN", "INDUS", "NOX", "RM",
+            "AGE", "DIS", "TAX", "PTRATIO"]
+LABEL = "MEDV"
+
+feature_cols = [tf.feature_column.numeric_column(k)
+                  for k in FEATURES] #list of Feature Columns
+
+def generate_estimator(output_dir):
+  return tf.estimator.DNNRegressor(feature_columns=feature_cols,
+                                            hidden_units=[10, 10],
+                                            model_dir=output_dir)
+
+def generate_input_fn(data_set):
+    def input_fn():
+      features = {k: tf.constant(data_set[k].values) for k in FEATURES}
+      labels = tf.constant(data_set[LABEL].values)
+      return features, labels
+    return input_fn
+
+def serving_input_fn():
+  #feature_placeholders are what the caller of the predict() method will have to provide
+  feature_placeholders = {
+      column.name: tf.placeholder(column.dtype, [None])
+      for column in feature_cols
+  }
+  
+  #features are what we actually pass to the estimator
+  features = {
+    # Inputs are rank 1 so that we can provide scalars to the server
+    # but Estimator expects rank 2, so we expand dimension
+    key: tf.expand_dims(tensor, -1)
+    for key, tensor in feature_placeholders.items()
+  }
+  return tf.estimator.export.ServingInputReceiver(
+    features, feature_placeholders
+  )
+
+%%bash
+mkdir trainer
+touch trainer/__init__.py
+
+%%writefile trainer/task.py
+
+import argparse
+import pandas as pd
+import tensorflow as tf
+from tensorflow.contrib.learn.python.learn import learn_runner
+from tensorflow.contrib.learn.python.learn.utils import saved_model_export_utils
+
+print(tf.__version__)
+tf.logging.set_verbosity(tf.logging.ERROR)
+
+data_train = pd.read_csv(
+  filepath_or_buffer='https://storage.googleapis.com/spls/gsp418/housing_train.csv',
+  names=["CRIM","ZN","INDUS","CHAS","NOX","RM","AGE","DIS","RAD","TAX","PTRATIO","MEDV"])
+
+data_test = pd.read_csv(
+  filepath_or_buffer='https://storage.googleapis.com/spls/gsp418/housing_test.csv',
+  names=["CRIM","ZN","INDUS","CHAS","NOX","RM","AGE","DIS","RAD","TAX","PTRATIO","MEDV"])
+
+FEATURES = ["CRIM", "ZN", "INDUS", "NOX", "RM",
+            "AGE", "DIS", "TAX", "PTRATIO"]
+LABEL = "MEDV"
+
+feature_cols = [tf.feature_column.numeric_column(k)
+                  for k in FEATURES] #list of Feature Columns
+
+def generate_estimator(output_dir):
+  return tf.estimator.DNNRegressor(feature_columns=feature_cols,
+                                            hidden_units=[10, 10],
+                                            model_dir=output_dir)
+
+def generate_input_fn(data_set):
+    def input_fn():
+      features = {k: tf.constant(data_set[k].values) for k in FEATURES}
+      labels = tf.constant(data_set[LABEL].values)
+      return features, labels
+    return input_fn
+
+def serving_input_fn():
+  #feature_placeholders are what the caller of the predict() method will have to provide
+  feature_placeholders = {
+      column.name: tf.placeholder(column.dtype, [None])
+      for column in feature_cols
+  }
+  #features are what we actually pass to the estimator
+  features = {
+    # Inputs are rank 1 so that we can provide scalars to the server
+    # but Estimator expects rank 2, so we expand dimension
+    key: tf.expand_dims(tensor, -1)
+    for key, tensor in feature_placeholders.items()
+  }
+  return tf.estimator.export.ServingInputReceiver(
+    features, feature_placeholders
+  )
+
+train_spec = tf.estimator.TrainSpec(
+                input_fn=generate_input_fn(data_train),
+                max_steps=3000)
+
+exporter = tf.estimator.LatestExporter('Servo', serving_input_fn)
+
+eval_spec=tf.estimator.EvalSpec(
+            input_fn=generate_input_fn(data_test),
+            steps=1,
+            exporters=exporter)
+
+######START CLOUD ML ENGINE BOILERPLATE######
+if __name__ == '__main__':
+  parser = argparse.ArgumentParser()
+  # Input Arguments
+  parser.add_argument(
+      '--output_dir',
+      help='GCS location to write checkpoints and export models',
+      required=True
+  )
+  parser.add_argument(
+        '--job-dir',
+        help='this model ignores this field, but it is required by gcloud',
+        default='junk'
+    )
+  args = parser.parse_args()
+  arguments = args.__dict__
+  output_dir = arguments.pop('output_dir')
+######END CLOUD ML ENGINE BOILERPLATE######
+
+  #initiate training job
+  tf.estimator.train_and_evaluate(generate_estimator(output_dir), train_spec, eval_spec)
+
+GCS_BUCKET = 'gs://BUCKET_NAME' #CHANGE THIS TO YOUR BUCKET
+PROJECT = 'PROJECT_ID' #CHANGE THIS TO YOUR PROJECT ID
+REGION = 'us-central1' #OPTIONALLY CHANGE THIS
+
+import os
+os.environ['GCS_BUCKET'] = GCS_BUCKET
+os.environ['PROJECT'] = PROJECT
+os.environ['REGION'] = REGION
+
+%%bash
+gcloud ai-platform local train \
+   --module-name=trainer.task \
+   --package-path=trainer \
+   -- \
+   --output_dir='./output'
+
+%%bash
+JOBNAME=housing_$(date -u +%y%m%d_%H%M%S)
+
+gcloud ai-platform jobs submit training $JOBNAME \
+   --region=$REGION \
+   --module-name=trainer.task \
+   --package-path=./trainer \
+   --job-dir=$GCS_BUCKET/$JOBNAME/ \
+   --runtime-version 1.15 \
+   -- \
+   --output_dir=$GCS_BUCKET/$JOBNAME/output
+
+%%bash
+JOBNAME=housing_$(date -u +%y%m%d_%H%M%S)
+
+gcloud ai-platform jobs submit training $JOBNAME \
+   --region=$REGION \
+   --module-name=trainer.task \
+   --package-path=./trainer \
+   --job-dir=$GCS_BUCKET/$JOBNAME \
+   --runtime-version 1.15 \
+   --scale-tier=STANDARD_1 \
+   -- \
+   --output_dir=$GCS_BUCKET/$JOBNAME/output
+
+%%bash
+JOBNAME=housing_$(date -u +%y%m%d_%H%M%S)
+
+gcloud ai-platform jobs submit training $JOBNAME \
+   --region=$REGION \
+   --module-name=trainer.task \
+   --package-path=./trainer \
+   --job-dir=$GCS_BUCKET/$JOBNAME \
+   --runtime-version 1.15 \
+   --scale-tier=BASIC_GPU \
+   -- \
+   --output_dir=$GCS_BUCKET/$JOBNAME/output
+
+%%writefile config.yaml
+trainingInput:
+  scaleTier: CUSTOM
+  masterType: complex_model_m_gpu
+  workerType: complex_model_m_gpu
+  workerCount: 1
+
+%%bash
+JOBNAME=housing_$(date -u +%y%m%d_%H%M%S)
+
+gcloud ai-platform jobs submit training $JOBNAME \
+   --region=$REGION \
+   --module-name=trainer.task \
+   --package-path=./trainer \
+   --job-dir=$GCS_BUCKET/$JOBNAME \
+   --runtime-version 1.15 \
+   --config config.yaml \
+   -- \
+   --output_dir=$GCS_BUCKET/$JOBNAME/output
+
+%%bash
+gcloud config set ai_platform/region global
+
+%%bash
+MODEL_NAME="housing_prices"
+MODEL_VERSION="v1"
+MODEL_LOCATION=output/export/Servo/$(ls output/export/Servo | tail -1) 
+
+#gcloud ai-platform versions delete ${MODEL_VERSION} --model ${MODEL_NAME} #Uncomment to overwrite existing version
+#gcloud ai-platform models delete ${MODEL_NAME} #Uncomment to overwrite existing model
+gcloud ai-platform models create ${MODEL_NAME} --regions $REGION
+gcloud ai-platform versions create ${MODEL_VERSION} --model ${MODEL_NAME} --origin ${MODEL_LOCATION} --staging-bucket=$GCS_BUCKET --runtime-version=1.15
+
+%%writefile records.json
+{"CRIM": 0.00632,"ZN": 18.0,"INDUS": 2.31,"NOX": 0.538, "RM": 6.575, "AGE": 65.2, "DIS": 4.0900, "TAX": 296.0, "PTRATIO": 15.3}
+{"CRIM": 0.00332,"ZN": 0.0,"INDUS": 2.31,"NOX": 0.437, "RM": 7.7, "AGE": 40.0, "DIS": 5.0900, "TAX": 250.0, "PTRATIO": 17.3}
+
+!gcloud ai-platform predict --model housing_prices --json-instances records.json
+
